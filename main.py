@@ -302,21 +302,31 @@ fwd_with_wh AS (
     CASE WHEN f.facility_wh IN ('PNQ','MUM') THEN 'PNQ + MUM' ELSE f.facility_wh END AS facility_grp,
     f.drop_state, f.status, f.created_dt, f.pickup_dt,
     f.delivery_dt, f.order_dt, f.pickup_ts, f.delivery_ts, f.created_ts,
-    -- PNQ and MUM are interchangeable: correct if order shipped from either AND nearest_wh is either
-    MAX(CASE
-      WHEN f.facility_wh IN ('PNQ','MUM') AND w.nearest_wh IN ('PNQ','MUM') THEN 1
-      WHEN f.facility_wh NOT IN ('PNQ','MUM') AND f.facility_wh = w.nearest_wh THEN 1
-      ELSE 0
-    END) AS is_correct_alloc
+    f.facility_wh,
+    w.nearest_wh
   FROM fwd f LEFT JOIN wh_map w ON f.drop_state = w.shipping_address_state
-  GROUP BY 1,2,3,4,5,6,7,8,9,10,11
+),
+-- demand-based correct/wrong: grouped by nearest WH (where order SHOULD come from)
+-- correct = shipped from right WH for that state; wrong = shipped from wrong WH
+demand_correct AS (
+  SELECT
+    CASE WHEN w.nearest_wh IN ('PNQ','MUM') THEN 'PNQ + MUM' ELSE w.nearest_wh END AS demand_grp,
+    COUNTIF(
+      (f.facility_wh IN ('PNQ','MUM') AND w.nearest_wh IN ('PNQ','MUM'))
+      OR (f.facility_wh NOT IN ('PNQ','MUM') AND f.facility_wh = w.nearest_wh)
+    ) AS correct_cnt,
+    COUNT(*) AS judged_cnt
+  FROM fwd f
+  JOIN wh_map w ON f.drop_state = w.shipping_address_state
+  WHERE f.facility_wh IS NOT NULL
+  GROUP BY demand_grp
 ),
 total AS (SELECT COUNT(DISTINCT awb) AS total_awb FROM fwd)
 SELECT f.facility_grp AS facility_wh,
   COUNT(DISTINCT f.awb) AS shipments,
   ROUND(COUNT(DISTINCT f.awb) / MAX(t.total_awb) * 100, 1) AS alloc_pct,
-  COUNTIF(f.is_correct_alloc = 1) AS correct_alloc_cnt,
-  ROUND(COUNTIF(f.is_correct_alloc = 1) / COUNT(DISTINCT f.awb) * 100, 1) AS correct_alloc_pct,
+  MAX(d.correct_cnt) AS correct_alloc_cnt,
+  ROUND(MAX(d.correct_cnt) / NULLIF(MAX(d.judged_cnt), 0) * 100, 1) AS correct_alloc_pct,
   COUNTIF(f.created_dt IS NOT NULL AND f.order_dt IS NOT NULL AND DATE_DIFF(f.created_dt, f.order_dt, DAY) <= 1) AS processed_24hr_cnt,
   ROUND(COUNTIF(f.created_dt IS NOT NULL AND f.order_dt IS NOT NULL AND DATE_DIFF(f.created_dt, f.order_dt, DAY) <= 1) / COUNT(DISTINCT f.awb) * 100, 1) AS processed_24hr_pct,
   ROUND(AVG(IF(f.created_dt IS NOT NULL AND f.order_dt IS NOT NULL AND DATE_DIFF(f.created_dt, f.order_dt, DAY) BETWEEN 0 AND 10, DATE_DIFF(f.created_dt, f.order_dt, DAY), NULL)), 1) AS avg_processing,
@@ -333,6 +343,7 @@ SELECT f.facility_grp AS facility_wh,
     THEN DATE_DIFF(f.delivery_dt, f.order_dt, DAY) END), 1) AS avg_o2d
 FROM fwd_with_wh f
 CROSS JOIN total t
+LEFT JOIN demand_correct d ON f.facility_grp = d.demand_grp
 WHERE f.facility_grp IS NOT NULL
 GROUP BY 1 ORDER BY shipments DESC
 """)
@@ -708,10 +719,10 @@ def build_facility_rows():
           {td(r.avg_o2d, lambda x: x > 5, 'd')}
         </tr>"""
     total_ships_fac = sum(r.shipments for r in facilities)
-    total_correct   = sum(r.correct_alloc_cnt for r in facilities)
     total_proc24    = sum(r.processed_24hr_cnt for r in facilities)
     total_pickup24  = sum(r.pickup_24hr_cnt for r in facilities)
-    tot_correct_pct  = round(total_correct  / total_ships_fac * 100, 1) if total_ships_fac else 0
+    # overall correct alloc % comes from wh_fit_kpi (demand-based overall = same denominator)
+    tot_correct_pct  = wh_fit_kpi.wh_fit_pct or 0
     tot_proc24_pct   = round(total_proc24   / total_ships_fac * 100, 1) if total_ships_fac else 0
     tot_pickup24_pct = round(total_pickup24 / total_ships_fac * 100, 1) if total_ships_fac else 0
     rows += f"""<tr>
